@@ -1,6 +1,6 @@
 # -*- Mode:Python; indent-tabs-mode:nil; tab-width:4 -*-
 #
-# Copyright (C) 2015-2020 Canonical Ltd
+# Copyright (C) 2015-2019 Canonical Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 3 as
@@ -31,6 +31,11 @@ Additionally, this plugin uses the following plugin-specific keywords:
       This includes npm, as would be downloaded from https://nodejs.org
       Defaults to the current LTS release.
 
+    - nodejs-channel:
+      (string, default: '')
+      The Snap Store channel to install nodejs from. If set to an empty string,
+      the node snap won't be installed at all.
+
     - nodejs-package-manager
       (string; default: yarn)
       The language package manager to use to drive installation
@@ -49,10 +54,11 @@ import shutil
 import subprocess
 import sys
 
+import snapcraft
 from snapcraft import sources
 from snapcraft.internal import errors
 from snapcraft.file_utils import link_or_copy, link_or_copy_tree
-from snapcraft.plugins.v1 import PluginV1
+
 
 _NODEJS_BASE = "node-v{version}-linux-{arch}"
 _NODEJS_VERSION = "8.12.0"
@@ -81,7 +87,7 @@ class NodejsPluginMissingPackageJsonError(errors.SnapcraftError):
     )
 
 
-class NodePlugin(PluginV1):
+class NodePlugin(snapcraft.BasePlugin):
     @classmethod
     def schema(cls):
         schema = super().schema()
@@ -89,6 +95,10 @@ class NodePlugin(PluginV1):
         schema["properties"]["nodejs-version"] = {
             "type": "string",
             "default": _NODEJS_VERSION,
+        }
+        schema["properties"]["nodejs-channel"] = {
+            "type": "string",
+            "default": ""
         }
         schema["properties"]["nodejs-package-manager"] = {
             "type": "string",
@@ -105,7 +115,15 @@ class NodePlugin(PluginV1):
     def get_pull_properties(cls):
         # Inform Snapcraft of the properties associated with pulling. If these
         # change in the YAML Snapcraft will consider the build step dirty.
-        return ["nodejs-version", "nodejs-package-manager", "nodejs-yarn-version"]
+        return ["nodejs-version", "nodejs-channel", "nodejs-package-manager",
+                "nodejs-yarn-version"]
+
+    @classmethod
+    def get_build_properties(cls):
+        # Inform Snapcraft of the properties associated with building. If these
+        # change in the YAML Snapcraft will consider the build step dirty.
+        return ["nodejs-version", "nodejs-channel", "nodejs-package-manager",
+                "nodejs-yarn-version"]
 
     @property
     def _nodejs_tar(self):
@@ -138,16 +156,22 @@ class NodePlugin(PluginV1):
         self._nodejs_tar_handle = None
         self._yarn_tar_handle = None
 
+        if self.options.nodejs_channel:
+            self.build_snaps.append(
+                "node/{}".format(self.options.nodejs_channel))
+
     def pull(self):
         super().pull()
 
         os.makedirs(self._npm_dir, exist_ok=True)
-        self._nodejs_tar.download()
-        if self.options.nodejs_package_manager == "yarn":
-            self._yarn_tar.download()
 
-        # install node and yarn.
-        self._install_node_and_yarn(rootdir=self.sourcedir)
+        if not self.options.nodejs_channel:
+            self._nodejs_tar.download()
+            if self.options.nodejs_package_manager == "yarn":
+                self._yarn_tar.download()
+
+        # do the install in the pull phase to download all dependencies.
+        self._install(rootdir=self.sourcedir)
 
     def clean_pull(self):
         super().clean_pull()
@@ -177,28 +201,24 @@ class NodePlugin(PluginV1):
                 self._manifest["yarn-lock-contents"] = lock_file.read()
 
         # Get the names and versions of installed packages
-        if self.options.nodejs_package_manager == "npm":
-            installed_node_packages = self._get_installed_node_packages(self.installdir)
-            self._manifest["node-packages"] = [
-                "{}={}".format(name, installed_node_packages[name])
-                for name in installed_node_packages
-            ]
-        # Skip this step if yarn is used, as it may produce different
-        # dependency trees than npm
-        else:
-            self._manifest["node-packages"] = []
-
-    def _install_node_and_yarn(self, rootdir):
-        self._nodejs_tar.provision(self._npm_dir, clean_target=False, keep_tarball=True)
-        if self.options.nodejs_package_manager == "yarn":
-            self._yarn_tar.provision(
-                self._npm_dir, clean_target=False, keep_tarball=True
-            )
-        # Check to see if package.json exists in pull step
-        self._get_package_json(rootdir)
+        installed_node_packages = self._get_installed_node_packages(self.installdir)
+        self._manifest["node-packages"] = [
+            "{}={}".format(name, installed_node_packages[name])
+            for name in installed_node_packages
+        ]
 
     def _install(self, rootdir):
-        cmd = [os.path.join(self._npm_dir, "bin", self.options.nodejs_package_manager)]
+
+        if not self.options.nodejs_channel:
+            self._nodejs_tar.provision(self._npm_dir, clean_target=False, keep_tarball=True)
+            if self.options.nodejs_package_manager == "yarn":
+                self._yarn_tar.provision(
+                    self._npm_dir, clean_target=False, keep_tarball=True
+                )
+            cmd = [os.path.join(self._npm_dir, "bin", self.options.nodejs_package_manager)]
+        else:
+            # use the npm or yarn from the 'node' snap installed.
+            cmd = [os.path.join("/snap/bin", self.options.nodejs_package_manager)]
 
         if self.options.nodejs_package_manager == "yarn":
             if os.getenv("http_proxy"):
@@ -207,11 +227,9 @@ class NodePlugin(PluginV1):
                 cmd.extend(["--https-proxy", os.getenv("https_proxy")])
 
         flags = []
+        if rootdir == self.builddir:
+            flags = ["--offline", "--prod"]
 
-        if self.options.nodejs_package_manager == "npm":
-            flags.append("--unsafe-perm")
-
-        # Run once to download dependencies and run install scripts
         self.run(cmd + ["install"] + flags, rootdir)
 
         package_json = self._get_package_json(rootdir)
@@ -241,9 +259,6 @@ class NodePlugin(PluginV1):
                 os.path.join(package_dir, "yarn.lock"),
             )
 
-        flags.append("--offline")
-        flags.append("--prod")
-
         self.run(cmd + ["install"] + flags, package_dir)
 
         return package_dir
@@ -263,15 +278,6 @@ class NodePlugin(PluginV1):
         else:
             new_path = npm_bin
 
-        # npm has the behavior that, if it detects that SUDO_UID is set,
-        # it will then set the uid of some of its child processes (such as
-        # git when installing a package that specifies a git repository)
-        # to that of the sudoer, ignoring --unsafe-perm entirely.
-        # We have to unset SUDO_UID and SUDO_GID to prevent this.
-
-        env.pop("SUDO_UID", None)
-        env.pop("SUDO_GID", None)
-
         env["PATH"] = new_path
         return env
 
@@ -284,7 +290,12 @@ class NodePlugin(PluginV1):
 
     def _get_installed_node_packages(self, cwd):
         # There is no yarn ls
-        cmd = [os.path.join(self._npm_dir, "bin", "npm"), "ls", "--json"]
+        if self.options.nodejs_channel:
+            cmd = ["/snap/bin/npm"]
+        else:
+            cmd = [os.path.join(self._npm_dir, "bin", "npm")]
+
+        cmd.extend(["ls", "--json"])
         try:
             output = self.run_output(cmd, cwd)
         except subprocess.CalledProcessError as error:
